@@ -1,0 +1,148 @@
+name: Claude Resolve Conflicts
+# Faz merge da branch base no PR e usa o Claude para resolver os conflitos.
+# Disparo: label "claude-conflitos" no PR, manual (Actions > Run workflow), ou pelo workflow "Claude Merge".
+# O push usa o secret CLAUDE_PUSH_TOKEN (PAT/App) quando existir, para que o Code Review
+# rode de novo no commit resolvido; com o GITHUB_TOKEN o GitHub não dispara workflows no push.
+# Só funciona para PRs de branches deste repositório (não de fork).
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Número do PR"
+        required: true
+        type: number
+
+concurrency:
+  group: claude-conflitos-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'claude-conflitos'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_PUSH_TOKEN || github.token }}
+
+      - name: Checkout da branch do PR
+        run: |
+          # O push vai para origin; branches de fork não são alcançáveis daqui.
+          if [ "$(gh pr view "$PR_NUMBER" --json isCrossRepository --jq .isCrossRepository)" = "true" ]; then
+            echo "::error::PR #$PR_NUMBER vem de fork; a resolução automática só funciona para branches deste repositório."
+            exit 1
+          fi
+          gh pr checkout "$PR_NUMBER"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge da base
+        id: merge
+        run: |
+          base=$(gh pr view "$PR_NUMBER" --json baseRefName --jq .baseRefName)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          git fetch origin "$base"
+          if git merge --no-edit "origin/$base"; then
+            echo "conflito=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U | tee "$RUNNER_TEMP/conflitos.txt"
+            # Merge falhou sem arquivos em conflito (ex.: históricos não relacionados): não há o que o Claude resolver.
+            if [ ! -s "$RUNNER_TEMP/conflitos.txt" ]; then
+              git merge --abort || true
+              echo "::error::git merge falhou sem arquivos em conflito; veja a saída acima."
+              exit 1
+            fi
+            echo "conflito=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.merge.outputs.conflito == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Restore
+        if: steps.merge.outputs.conflito == 'true' && hashFiles('pom.xml') != ''
+        run: mvn -B -ntp dependency:go-offline
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.merge.outputs.conflito == 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Edit,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(mvn:*)"
+          prompt: |
+            Repositório: ${{ github.repository }}
+            PR: #${{ env.PR_NUMBER }} (a branch do PR já está em checkout).
+
+            Tarefa: resolver os conflitos do merge de `origin/${{ steps.merge.outputs.base }}` nesta branch.
+            O merge já foi iniciado e está pendente. Arquivos em conflito: `git diff --name-only --diff-filter=U`.
+
+            1. Entenda a intenção de cada lado antes de editar:
+               - O que o PR muda: `gh pr view ${{ env.PR_NUMBER }}` e `gh pr diff ${{ env.PR_NUMBER }}`.
+               - O que mudou na base: `git log --oneline HEAD..origin/${{ steps.merge.outputs.base }}` e `git diff HEAD...origin/${{ steps.merge.outputs.base }} -- <arquivo>`.
+
+            2. Para cada arquivo em conflito, edite removendo todos os marcadores (<<<<<<<, =======, >>>>>>>)
+               e preservando as duas intenções. Não descarte mudanças da base nem do PR sem motivo claro.
+               Não altere nada além do necessário para resolver os conflitos.
+
+            3. Valide com `mvn -B -ntp package` (se o `pom.xml` ainda não existir, apenas confira a resolução manualmente). Se quebrar, ajuste a resolução.
+
+            4. `git add` de cada arquivo resolvido. NÃO faça commit nem push: o workflow faz isso depois de validar.
+
+            5. Se algum conflito exigir decisão de produto ou você não tiver segurança na resolução,
+               deixe o arquivo sem `git add` e explique no comentário.
+
+            6. Poste um comentário no PR (`gh pr comment`) com título "Claude Resolve Conflicts" e uma tabela:
+               arquivo | como resolveu.
+
+            Responda sempre em português.
+
+      - name: Valida resolução e commita
+        if: steps.merge.outputs.conflito == 'true'
+        run: |
+          set -euo pipefail
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Ainda há arquivos em conflito:"; git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          while IFS= read -r f; do
+            if [ -f "$f" ] && grep -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' "$f"; then
+              echo "::error::Marcadores de conflito restantes em $f"
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/conflitos.txt"
+          if [ -f pom.xml ]; then mvn -B -ntp package; fi
+          git commit --no-edit
+
+      - name: Push
+        run: |
+          branch=$(git rev-parse --abbrev-ref HEAD)
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$branch")" ]; then
+            echo "Branch já está atualizada com a base; nada a enviar."
+          else
+            git push origin "HEAD:$branch"
+          fi
+
+      - name: Comenta falha
+        if: failure()
+        run: |
+          gh pr comment "$PR_NUMBER" --body "**Claude Resolve Conflicts** — não consegui resolver os conflitos automaticamente. Veja o log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. A label \`claude-conflitos\` foi removida; aplique-a de novo para tentar outra vez."
+
+      - name: Remove label claude-conflitos
+        if: always() && github.event_name == 'pull_request'
+        run: gh pr edit "$PR_NUMBER" --remove-label claude-conflitos || true

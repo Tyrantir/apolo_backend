@@ -1,0 +1,53 @@
+name: Build
+# Check objetivo do PR: compila o projeto e barra segredo versionado.
+# O Claude Merge exige este workflow com sucesso no commit atual antes de mesclar.
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Barra segredo versionado
+        run: |
+          set -euo pipefail
+          # Arquivos que só podem existir na máquina (ver .gitignore e CLAUDE.md).
+          proibidos=$(git ls-files | grep -i -E '(^|/)application-local\.(yml|yaml|properties)$|(^|/)\.env$|\.(pfx|p12|jks|pem|key)$' || true)
+          if [ -n "$proibidos" ]; then
+            echo "::error::Arquivo de segredo versionado:"; echo "$proibidos"; exit 1
+          fi
+          # Senha/segredo literal em config; interpolação (${VAR}) é permitida.
+          senhas=$(git grep -n -i -E '(password|senha|secret)\s*[:=]\s*[^\s$#]' -- . ':!*.md' || true)
+          if [ -n "$senhas" ]; then
+            echo "::error::Segredo literal no código:"; echo "$senhas"; exit 1
+          fi
+
+      - name: Verifica se o projeto Maven já existe
+        id: projeto
+        run: |
+          if [ -f pom.xml ]; then
+            echo "existe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "existe=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::pom.xml ainda não existe; build pulado."
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.projeto.outputs.existe == 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build
+        if: steps.projeto.outputs.existe == 'true'
+        run: mvn -B -ntp package
