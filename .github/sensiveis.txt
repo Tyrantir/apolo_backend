@@ -1,0 +1,7 @@
+# Caminhos que exigem aprovação humana antes do Claude Merge (um regex ERE por linha, contra o path do arquivo).
+# Segredo/config, schema multi-tenant, resolução de tenant, autenticação e as próprias automações.
+application-local\.(yml|yaml|properties)$
+^src/main/resources/db/
+(^|/)tenancy/
+(^|/)identity/
+^\.github/

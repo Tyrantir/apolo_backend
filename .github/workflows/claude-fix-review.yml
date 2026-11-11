@@ -1,0 +1,105 @@
+name: Claude Fix Review
+# Valida os comentários de review de um PR e aplica as melhorias procedentes.
+# Disparo: label "claude-fix" no PR, ou manual (Actions > Run workflow) informando o número do PR.
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Número do PR"
+        required: true
+        type: number
+
+concurrency:
+  group: claude-fix-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'claude-fix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout da branch do PR
+        run: gh pr checkout "$PR_NUMBER"
+
+      # Evita loop review → fix → review: após 2 rodadas o PR volta para um humano.
+      - name: Limite de rodadas
+        id: limite
+        run: |
+          rodadas=$(gh pr view "$PR_NUMBER" --json commits --jq '[.commits[] | select(.messageHeadline | startswith("fix: aplica ajustes do review do PR #'"$PR_NUMBER"'"))] | length')
+          if [ "$rodadas" -ge 2 ]; then
+            gh pr comment "$PR_NUMBER" --body "**Claude Fix Review** — limite de 2 rodadas atingido; o restante precisa de revisão humana."
+            echo "estourou=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.limite.outputs.estourou != 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Restore
+        if: steps.limite.outputs.estourou != 'true' && hashFiles('pom.xml') != ''
+        run: mvn -B -ntp dependency:go-offline
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.limite.outputs.estourou != 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh api:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(mvn:*)"
+          prompt: |
+            Repositório: ${{ github.repository }}
+            PR: #${{ env.PR_NUMBER }} (a branch do PR já está em checkout).
+
+            Tarefa: validar o retorno do review deste PR e aplicar as melhorias procedentes.
+
+            1. Colete o feedback:
+               - Comentários inline: `gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate`
+               - Reviews: `gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews --paginate`
+               - Comentários gerais: `gh pr view ${{ env.PR_NUMBER }} --comments`
+               Ignore comentários já respondidos por você em execuções anteriores e threads resolvidas.
+               Ignore comentários deste próprio workflow (resumos "Claude Fix Review").
+
+            2. Para cada ponto levantado, leia o código atual e classifique:
+               - PROCEDENTE: o problema existe e a correção é segura → aplicar.
+               - IMPROCEDENTE: o apontamento está errado ou não se aplica → não alterar, justificar.
+               - FORA DO ESCOPO / DECISÃO DE PRODUTO: não alterar, sinalizar para humano.
+               Não confie cegamente no review: verifique no código antes de mudar.
+
+            3. Aplique as correções procedentes com mudanças mínimas, seguindo o estilo do código ao redor.
+               Não refatore além do pedido.
+
+            4. Valide com `mvn -B -ntp package` (se o `pom.xml` ainda não existir, apenas confira a mudança manualmente). Se quebrar, corrija ou reverta a mudança que causou.
+
+            5. Se houve alterações: `git add` dos arquivos alterados, um commit com mensagem
+               `fix: aplica ajustes do review do PR #${{ env.PR_NUMBER }}` listando os pontos no corpo, e `git push`.
+
+            6. Responda cada comentário inline tratado:
+               `gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments/<id>/replies -f body="..."`
+               dizendo se foi aplicado (com o hash do commit) ou por que não foi.
+
+            7. Poste um comentário-resumo no PR (`gh pr comment`) com título "Claude Fix Review" e uma tabela:
+               ponto | classificação | ação.
+
+            Responda sempre em português.
+
+      - name: Remove label claude-fix
+        if: always() && github.event_name == 'pull_request'
+        run: gh pr edit "$PR_NUMBER" --remove-label claude-fix || true
